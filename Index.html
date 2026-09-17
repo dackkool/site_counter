@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>多目標 AI 選址考察助手 (人/車/寵物)</title>
+  <!-- 載入 TensorFlow.js 及 COCO-SSD 多目標物體檢測模型 -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #000; color: #fff; overflow: hidden; touch-action: none; }
+    #container { position: relative; width: 100vw; height: 100vh; }
+    video { display: none; }
+    canvas { width: 100%; height: 100%; object-fit: cover; }
+    
+    /* 頂部多目標數據儀表板 */
+    .dashboard { position: absolute; top: 10px; left: 10px; right: 10px; background: rgba(18, 18, 18, 0.88); backdrop-filter: blur(10px); padding: 10px; border-radius: 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; z-index: 10; border: 1px solid rgba(255,255,255,0.12); }
+    .stat-item { text-align: center; }
+    .stat-value { font-size: 18px; font-weight: bold; }
+    .stat-label { font-size: 10px; color: #aaa; margin-top: 2px; }
+
+    /* 控制面板 */
+    .panel { position: absolute; bottom: 75px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); padding: 10px 14px; border-radius: 16px; z-index: 10; display: flex; flex-direction: column; gap: 8px; width: 92%; max-width: 460px; font-size: 13px; }
+    .panel-row { display: flex; justify-content: space-between; align-items: center; }
+    .timer-display { font-family: monospace; font-size: 16px; color: #FFD700; font-weight: bold; }
+
+    select, input { background: #222; color: #fff; border: 1px solid #555; padding: 4px 8px; border-radius: 6px; }
+
+    /* 控制按鈕列 */
+    .controls { position: absolute; bottom: 15px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; z-index: 10; width: 92%; max-width: 460px; }
+    button { flex: 1; padding: 12px 6px; border: none; border-radius: 10px; font-weight: bold; font-size: 13px; color: white; cursor: pointer; }
+    .btn-start { background: #10B981; }
+    .btn-stop { background: #EF4444; }
+    .btn-export { background: #8B5CF6; }
+    .btn-switch { background: #4B5563; }
+
+    /* AI 模型加載提示 */
+    #loading-overlay { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.9); z-index: 99; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+    .spinner { border: 4px solid #333; border-top: 4px solid #00FFCC; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin-bottom: 15px; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<!-- 加載提示區 -->
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <p id="loading-text">正在載入 AI 多目標識別模型...</p>
+</div>
+
+<div id="container">
+  <!-- 多目標數據儀表板 -->
+  <div class="dashboard">
+    <div class="stat-item">
+      <div class="stat-value" style="color:#00FFCC" id="count-person">0</div>
+      <div class="stat-label">行人 (Person)</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" style="color:#FFB703" id="count-vehicle">0</div>
+      <div class="stat-label">車輛 (Car/Bus)</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" style="color:#FF0055" id="count-pet">0</div>
+      <div class="stat-label">寵物/狗 (Pet)</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" style="color:#3B82F6" id="ppm">0.0</div>
+      <div class="stat-label">總流量/分</div>
+    </div>
+  </div>
+
+  <!-- 時間與檢測線設定 -->
+  <div class="panel">
+    <div class="panel-row">
+      <span>考察時長：</span>
+      <select id="timer-select">
+        <option value="15">15 分鐘 (速測)</option>
+        <option value="30" selected>30 分鐘 (推薦)</option>
+        <option value="60">60 分鐘 (1小時)</option>
+        <option value="1">1 分鐘 (快速測試)</option>
+      </select>
+      <span class="timer-display" id="timer-clock">00:00</span>
+    </div>
+    
+    <div class="panel-row">
+      <span>調整檢測線位置：</span>
+      <input type="range" id="line-position" min="0.1" max="0.9" step="0.05" value="0.5" style="width: 50%;">
+      <span id="line-pos-text" style="color:#00FFCC;">50%</span>
+    </div>
+  </div>
+
+  <video id="input_video" playsinline autoplay muted></video>
+  <canvas id="output_canvas"></canvas>
+
+  <div class="controls">
+    <button id="btn-toggle-rec" class="btn-start" onclick="toggleRecording()">開始考察</button>
+    <button class="btn-export" onclick="exportCSV()">匯出選址報告 (CSV)</button>
+    <button class="btn-switch" onclick="toggleCamera()">切換鏡頭</button>
+  </div>
+</div>
+
+<script>
+  const videoElement = document.getElementById('input_video');
+  const canvasElement = document.getElementById('output_canvas');
+  const canvasCtx = canvasElement.getContext('2d');
+  const lineSlider = document.getElementById('line-position');
+
+  let model = null;
+  let isRecording = false;
+  let currentFacingMode = 'environment';
+  
+  // 統計變量
+  let countPerson = 0;
+  let countVehicle = 0;
+  let countPet = 0;
+
+  // 跨越檢測紀錄
+  let trackedObjects = new Map();
+  let objIdCounter = 0;
+
+  // 計時變量
+  let timerInterval = null;
+  let totalSeconds = 0;
+  let elapsedSeconds = 0;
+
+  lineSlider.oninput = function() {
+    document.getElementById('line-pos-text').innerText = Math.round(this.value * 100) + '%';
+  };
+
+  // 防休眠
+  async function enableWakeLock() {
+    try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+  enableWakeLock();
+
+  // 初始化 COCO-SSD 模型
+  async function loadModel() {
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' }); // 輕量化模型，專為手機流暢度優化
+    document.getElementById('loading-overlay').style.display = 'none';
+    startCamera();
+  }
+
+  // 啟動鏡頭串流
+  function startCamera() {
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: currentFacingMode, width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    }).then((stream) => {
+      videoElement.srcObject = stream;
+      videoElement.onloadedmetadata = () => {
+        videoElement.play();
+        detectFrame();
+      };
+    }).catch(err => alert("相機權限開啟失敗: " + err));
+  }
+
+  // 核心檢測與渲染循環
+  async function detectFrame() {
+    if (videoElement.readyState === 4) {
+      canvasElement.width = window.innerWidth;
+      canvasElement.height = window.innerHeight;
+
+      // AI 推理：識別物體
+      const predictions = await model.detect(videoElement);
+
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+      // 繪製相機背景
+      canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+      // 設定檢測線 (垂直過界線)
+      const lineX = canvasElement.width * parseFloat(lineSlider.value);
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(lineX, 0);
+      canvasCtx.lineTo(lineX, canvasElement.height);
+      canvasCtx.lineWidth = 4;
+      canvasCtx.strokeStyle = isRecording ? '#00FFCC' : '#FF4444';
+      canvasCtx.setLineDash([10, 5]);
+      canvasCtx.stroke();
+
+      canvasCtx.fillStyle = '#FFF';
+      canvasCtx.font = '14px Arial';
+      canvasCtx.fillText(isRecording ? '● 正在記錄多目標人流/車流...' : '請點擊「開始考察」', lineX + 10, 30);
+
+      // 解析辨識到的物體
+      predictions.forEach(pred => {
+        const [x, y, width, height] = pred.bbox;
+        // 將比例映射至全螢幕 Canvas
+        const scaleX = canvasElement.width / videoElement.videoWidth;
+        const scaleY = canvasElement.height / videoElement.videoHeight;
+        
+        const mappedX = x * scaleX;
+        const mappedY = y * scaleY;
+        const mappedW = width * scaleX;
+        const mappedH = height * scaleY;
+
+        const centerX = mappedX + mappedW / 2;
+        const category = classifyCategory(pred.class);
+
+        if (category) {
+          // 繪製物體外框與標籤
+          canvasCtx.strokeStyle = getCategoryColor(category);
+          canvasCtx.lineWidth = 2;
+          canvasCtx.strokeRect(mappedX, mappedY, mappedW, mappedH);
+
+          canvasCtx.fillStyle = getCategoryColor(category);
+          canvasCtx.font = '12px Arial';
+          canvasCtx.fillText(`${pred.class} (${Math.round(pred.score * 100)}%)`, mappedX, mappedY > 10 ? mappedY - 5 : 10);
+
+          // 只有在考察進行中才計數
+          if (isRecording) {
+            checkCrossing(pred.class, category, centerX, mappedY);
+          }
+        }
+      });
+
+      canvasCtx.restore();
+    }
+    requestAnimationFrame(detectFrame);
+  }
+
+  // 分類判斷邏輯
+  function classifyCategory(className) {
+    if (className === 'person') return 'person';
+    if (['car', 'truck', 'bus', 'motorcycle', 'bicycle'].includes(className)) return 'vehicle';
+    if (['dog', 'cat'].includes(className)) return 'pet';
+    return null;
+  }
+
+  function getCategoryColor(category) {
+    if (category === 'person') return '#00FFCC';
+    if (category === 'vehicle') return '#FFB703';
+    if (category === 'pet') return '#FF0055';
+    return '#FFFFFF';
+  }
+
+  // 跨越檢測線與數據計數
+  function checkCrossing(rawClass, category, currentX, currentY) {
+    const lineX = canvasElement.width * parseFloat(lineSlider.value);
+    // 簡易物理近距離配對追蹤
+    let matchedId = null;
+    let minDistance = 60;
+
+    for (let [id, obj] of trackedObjects.entries()) {
+      let dist = Math.abs(obj.x - currentX) + Math.abs(obj.y - currentY);
+      if (dist < minDistance && obj.category === category) {
+        minDistance = dist;
+        matchedId = id;
+      }
+    }
+
+    if (matchedId !== null) {
+      let trackedObj = trackedObjects.get(matchedId);
+      let lastX = trackedObj.x;
+
+      // 觸發過界 (無論由左至右或由右至左)
+      if ((lastX < lineX && currentX >= lineX) || (lastX > lineX && currentX <= lineX)) {
+        if (category === 'person') countPerson++;
+        else if (category === 'vehicle') countVehicle++;
+        else if (category === 'pet') countPet++;
+        updateUI();
+      }
+      trackedObj.x = currentX;
+      trackedObj.y = currentY;
+      trackedObj.updated = Date.now();
+    } else {
+      objIdCounter++;
+      trackedObjects.set(objIdCounter, { category, x: currentX, y: currentY, updated: Date.now() });
+    }
+
+    // 清理舊追蹤資料
+    const now = Date.now();
+    for (let [id, obj] of trackedObjects.entries()) {
+      if (now - obj.updated > 1000) trackedObjects.delete(id);
+    }
+  }
+
+  // 開始 / 暫停考察控制
+  function toggleRecording() {
+    const btn = document.getElementById('btn-toggle-rec');
+    if (!isRecording) {
+      isRecording = true;
+      btn.innerText = '暫停考察';
+      btn.className = 'btn-stop';
+
+      const minutes = parseInt(document.getElementById('timer-select').value);
+      totalSeconds = minutes * 60;
+      
+      if (timerInterval) clearInterval(timerInterval);
+      
+      timerInterval = setInterval(() => {
+        elapsedSeconds++;
+        updateTimerDisplay();
+
+        if (totalSeconds > 0 && elapsedSeconds >= totalSeconds) {
+          toggleRecording();
+          alert('設定的考察時間已到達！多目標選址數據已完成並鎖定。');
+        }
+      }, 1000);
+
+    } else {
+      isRecording = false;
+      btn.innerText = '繼續考察';
+      btn.className = 'btn-start';
+      if (timerInterval) clearInterval(timerInterval);
+    }
+  }
+
+  function updateTimerDisplay() {
+    let remaining = totalSeconds > 0 ? (totalSeconds - elapsedSeconds) : elapsedSeconds;
+    let m = Math.floor(remaining / 60).toString().padStart(2, '0');
+    let s = (remaining % 60).toString().padStart(2, '0');
+    document.getElementById('timer-clock').innerText = `${m}:${s}`;
+    updateUI();
+  }
+
+  function updateUI() {
+    document.getElementById('count-person').innerText = countPerson;
+    document.getElementById('count-vehicle').innerText = countVehicle;
+    document.getElementById('count-pet').innerText = countPet;
+
+    const total = countPerson + countVehicle + countPet;
+    const minutes = elapsedSeconds / 60;
+    const ppm = minutes > 0 ? (total / minutes).toFixed(1) : 0.0;
+    document.getElementById('ppm').innerText = ppm;
+  }
+
+  // 導出 CSV 多維選址報告
+  function exportCSV() {
+    const total = countPerson + countVehicle + countPet;
+    const minutes = (elapsedSeconds / 60).toFixed(1);
+    const ppm = minutes > 0 ? (total / minutes).toFixed(1) : 0;
+    const now = new Date().toLocaleString('zh-HK');
+
+    let csvContent = "data:text/csv;charset=utf-8,\uFEFF";
+    csvContent += "多目標選址考察報告項目,數據\n";
+    csvContent += `考察時間,${now}\n`;
+    csvContent += `實測總時長(分鐘),${minutes}\n`;
+    csvContent += `行人(Person)流量,${countPerson}\n`;
+    csvContent += `車輛(Car/Bus/Truck)流量,${countVehicle}\n`;
+    csvContent += `寵物(Dog/Cat)流量,${countPet}\n`;
+    csvContent += `總綜合流量,${total}\n`;
+    csvContent += `每分鐘平均流量(PPM),${ppm}\n`;
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `多目標選址考察報告_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function toggleCamera() {
+    currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+    startCamera();
+  }
+
+  // 頁面載入後自動加載 AI 模型
+  window.onload = loadModel;
+</script>
+
+</body>
+</html>
