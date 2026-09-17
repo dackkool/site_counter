@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <!-- 針對手機 Viewport 優化：禁止縮放、適應全螢幕 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>AI 多目標選址考察助手</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-user-select: none; }
+    
+    /* 使用 100dvh 解決 iOS Safari 網址列伸縮導致破版的問題 */
+    html, body {
+      width: 100%;
+      height: 100dvh;
+      background: #000;
+      color: #fff;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    #container {
+      position: relative;
+      width: 100%;
+      height: 100dvh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    video { display: none; }
+
+    /* 全螢幕覆蓋 */
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* 頂部儀表板 */
+    .dashboard {
+      position: absolute;
+      top: max(12px, env(safe-area-inset-top));
+      left: 12px;
+      right: 12px;
+      background: rgba(18, 18, 18, 0.88);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      padding: 10px;
+      border-radius: 16px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      z-index: 10;
+      border: 1px solid rgba(255,255,255,0.15);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+    .stat-item { text-align: center; }
+    .stat-value { font-size: 18px; font-weight: bold; }
+    .stat-label { font-size: 10px; color: #aaa; margin-top: 2px; }
+
+    /* 控制面板 */
+    .panel {
+      position: absolute;
+      bottom: 75px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(15, 15, 15, 0.88);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      padding: 10px 14px;
+      border-radius: 16px;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: calc(100% - 24px);
+      max-width: 480px;
+      font-size: 12px;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .panel-row { display: flex; justify-content: space-between; align-items: center; }
+    .timer-display { font-family: monospace; font-size: 15px; color: #FFD700; font-weight: bold; }
+
+    select, input {
+      background: #222;
+      color: #fff;
+      border: 1px solid #555;
+      padding: 5px 8px;
+      border-radius: 8px;
+      font-size: 12px;
+      outline: none;
+    }
+
+    /* 按鈕列 */
+    .controls {
+      position: absolute;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 8px;
+      z-index: 10;
+      width: calc(100% - 24px);
+      max-width: 480px;
+    }
+    button {
+      flex: 1;
+      padding: 12px 6px;
+      border: none;
+      border-radius: 12px;
+      font-weight: bold;
+      font-size: 13px;
+      color: white;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    button:active { opacity: 0.8; }
+    .btn-start { background: #10B981; }
+    .btn-stop { background: #EF4444; }
+    .btn-export { background: #8B5CF6; }
+    .btn-switch { background: #4B5563; }
+
+    /* 加載蓋板 */
+    #loading-overlay {
+      position: absolute;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.92);
+      z-index: 99;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+    }
+    .spinner {
+      border: 4px solid #333; border-top: 4px solid #00FFCC;
+      border-radius: 50%; width: 42px; height: 42px;
+      animation: spin 1s linear infinite; margin-bottom: 15px;
+    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<div id="loading-overlay">
+  <div class="spinner"></div>
+  <p id="loading-text">正在初始化 AI 模型，請稍候...</p>
+</div>
+
+<div id="container">
+  <!-- 儀表板 -->
+  <div class="dashboard">
+    <div class="stat-item">
+      <div class="stat-value" style="color:#00FFCC" id="count-target1">0</div>
+      <div class="stat-label" id="label-target1">目標 A</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" style="color:#FFB703" id="count-target2">0</div>
+      <div class="stat-label" id="label-target2">目標 B</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" style="color:#FFD700" id="count-total">0</div>
+      <div class="stat-label">總計數量</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value" style="color:#3B82F6" id="ppm">0.0</div>
+      <div class="stat-label">流量/分鐘</div>
+    </div>
+  </div>
+
+  <!-- 下拉選單與控制面板 -->
+  <div class="panel">
+    <div class="panel-row">
+      <span>自選檢測目標 A：</span>
+      <select id="select-target1" onchange="onTargetChange()">
+        <option value="person" selected>行人 (Person)</option>
+        <option value="vehicle">車輛 (Car/Bus/Truck)</option>
+        <option value="pet">寵物/狗 (Dog/Cat)</option>
+        <option value="bag">背包/手袋 (Backpack/Handbag)</option>
+        <option value="bike">單車/電單車 (Bicycle/Motorcycle)</option>
+      </select>
+    </div>
+
+    <div class="panel-row">
+      <span>自選檢測目標 B：</span>
+      <select id="select-target2" onchange="onTargetChange()">
+        <option value="vehicle" selected>車輛 (Car/Bus/Truck)</option>
+        <option value="person">行人 (Person)</option>
+        <option value="pet">寵物/狗 (Dog/Cat)</option>
+        <option value="bag">背包/手袋 (Backpack/Handbag)</option>
+        <option value="bike">單車/電單車 (Bicycle/Motorcycle)</option>
+        <option value="none">-- 不指定 --</option>
+      </select>
+    </div>
+
+    <div class="panel-row">
+      <span>觀察時間與檢測線：</span>
+      <select id="timer-select">
+        <option value="15">15 分鐘</option>
+        <option value="30" selected>30 分鐘</option>
+        <option value="60">60 分鐘</option>
+        <option value="1">1 分鐘 (測試)</option>
+      </select>
+      <input type="range" id="line-position" min="0.1" max="0.9" step="0.05" value="0.5" style="width: 30%;">
+      <span class="timer-display" id="timer-clock">00:00</span>
+    </div>
+  </div>
+
+  <video id="input_video" playsinline autoplay muted></video>
+  <canvas id="output_canvas"></canvas>
+
+  <div class="controls">
+    <button id="btn-toggle-rec" class="btn-start" onclick="toggleRecording()">開始考察</button>
+    <button class="btn-export" onclick="exportCSV()">匯出報告 (CSV)</button>
+    <button class="btn-switch" onclick="toggleCamera()">切換鏡頭</button>
+  </div>
+</div>
+
+<script>
+  const videoElement = document.getElementById('input_video');
+  const canvasElement = document.getElementById('output_canvas');
+  const canvasCtx = canvasElement.getContext('2d');
+  const lineSlider = document.getElementById('line-position');
+
+  let model = null;
+  let isRecording = false;
+  let currentFacingMode = 'environment';
+  
+  let countTarget1 = 0;
+  let countTarget2 = 0;
+
+  let trackedObjects = new Map();
+  let objIdCounter = 0;
+
+  let timerInterval = null;
+  let totalSeconds = 0;
+  let elapsedSeconds = 0;
+
+  // 物類別映射集合
+  const CATEGORY_MAP = {
+    'person': ['person'],
+    'vehicle': ['car', 'bus', 'truck'],
+    'pet': ['dog', 'cat'],
+    'bag': ['backpack', 'handbag', 'suitcase'],
+    'bike': ['bicycle', 'motorcycle']
+  };
+
+  async function enableWakeLock() {
+    try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+  enableWakeLock();
+
+  async function loadModel() {
+    model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    document.getElementById('loading-overlay').style.display = 'none';
+    onTargetChange();
+    startCamera();
+  }
+
+  function onTargetChange() {
+    const t1Text = document.getElementById('select-target1').options[document.getElementById('select-target1').selectedIndex].text;
+    const t2Text = document.getElementById('select-target2').options[document.getElementById('select-target2').selectedIndex].text;
+    
+    document.getElementById('label-target1').innerText = t1Text.split(' ')[0];
+    document.getElementById('label-target2').innerText = t2Text.split(' ')[0];
+  }
+
+  function startCamera() {
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: currentFacingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    }).then((stream) => {
+      videoElement.srcObject = stream;
+      videoElement.onloadedmetadata = () => {
+        videoElement.play();
+        detectFrame();
+      };
+    }).catch(err => alert("相機開啟失敗: " + err));
+  }
+
+  async function detectFrame() {
+    if (videoElement.readyState === 4) {
+      // 確保 Canvas 完全與手機螢幕尺寸 1:1 適應
+      const rect = canvasElement.getBoundingClientRect();
+      canvasElement.width = rect.width;
+      canvasElement.height = rect.height;
+
+      const predictions = await model.detect(videoElement);
+
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+      
+      // 將相機影片覆蓋全螢幕
+      canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+      const lineX = canvasElement.width * parseFloat(lineSlider.value);
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(lineX, 0);
+      canvasCtx.lineTo(lineX, canvasElement.height);
+      canvasCtx.lineWidth = 4;
+      canvasCtx.strokeStyle = isRecording ? '#00FFCC' : '#FF4444';
+      canvasCtx.setLineDash([10, 5]);
+      canvasCtx.stroke();
+
+      canvasCtx.fillStyle = '#FFF';
+      canvasCtx.font = '14px Arial';
+      canvasCtx.fillText(isRecording ? '● 考察進行中...' : 'PAUSED (請按開始)', lineX + 10, 30);
+
+      const target1Key = document.getElementById('select-target1').value;
+      const target2Key = document.getElementById('select-target2').value;
+
+      predictions.forEach(pred => {
+        const [x, y, width, height] = pred.bbox;
+        const scaleX = canvasElement.width / videoElement.videoWidth;
+        const scaleY = canvasElement.height / videoElement.videoHeight;
+        
+        const mappedX = x * scaleX;
+        const mappedY = y * scaleY;
+        const mappedW = width * scaleX;
+        const mappedH = height * scaleY;
+        const centerX = mappedX + mappedW / 2;
+
+        let detectedGroup = null;
+        if (CATEGORY_MAP[target1Key] && CATEGORY_MAP[target1Key].includes(pred.class)) {
+          detectedGroup = 'target1';
+        } else if (target2Key !== 'none' && CATEGORY_MAP[target2Key] && CATEGORY_MAP[target2Key].includes(pred.class)) {
+          detectedGroup = 'target2';
+        }
+
+        if (detectedGroup) {
+          const color = detectedGroup === 'target1' ? '#00FFCC' : '#FFB703';
+          canvasCtx.strokeStyle = color;
+          canvasCtx.lineWidth = 2;
+          canvasCtx.strokeRect(mappedX, mappedY, mappedW, mappedH);
+
+          canvasCtx.fillStyle = color;
+          canvasCtx.font = '12px Arial';
+          canvasCtx.fillText(`${pred.class} (${Math.round(pred.score * 100)}%)`, mappedX, mappedY > 12 ? mappedY - 5 : 12);
+
+          if (isRecording) {
+            checkCrossing(detectedGroup, centerX, mappedY);
+          }
+        }
+      });
+
+      canvasCtx.restore();
+    }
+    requestAnimationFrame(detectFrame);
+  }
+
+  function checkCrossing(group, currentX, currentY) {
+    const lineX = canvasElement.width * parseFloat(lineSlider.value);
+    let matchedId = null;
+    let minDistance = 60;
+
+    for (let [id, obj] of trackedObjects.entries()) {
+      let dist = Math.abs(obj.x - currentX) + Math.abs(obj.y - currentY);
+      if (dist < minDistance && obj.group === group) {
+        minDistance = dist;
+        matchedId = id;
+      }
+    }
+
+    if (matchedId !== null) {
+      let trackedObj = trackedObjects.get(matchedId);
+      let lastX = trackedObj.x;
+
+      if ((lastX < lineX && currentX >= lineX) || (lastX > lineX && currentX <= lineX)) {
+        if (group === 'target1') countTarget1++;
+        else if (group === 'target2') countTarget2++;
+        updateUI();
+      }
+      trackedObj.x = currentX;
+      trackedObj.y = currentY;
+      trackedObj.updated = Date.now();
+    } else {
+      objIdCounter++;
+      trackedObjects.set(objIdCounter, { group, x: currentX, y: currentY, updated: Date.now() });
+    }
+
+    const now = Date.now();
+    for (let [id, obj] of trackedObjects.entries()) {
+      if (now - obj.updated > 1000) trackedObjects.delete(id);
+    }
+  }
+
+  function toggleRecording() {
+    const btn = document.getElementById('btn-toggle-rec');
+    if (!isRecording) {
+      isRecording = true;
+      btn.innerText = '暫停考察';
+      btn.className = 'btn-stop';
+
+      const minutes = parseInt(document.getElementById('timer-select').value);
+      totalSeconds = minutes * 60;
+      
+      if (timerInterval) clearInterval(timerInterval);
+      
+      timerInterval = setInterval(() => {
+        elapsedSeconds++;
+        updateTimerDisplay();
+
+        if (totalSeconds > 0 && elapsedSeconds >= totalSeconds) {
+          toggleRecording();
+          alert('設定的考察時間到達！數據已自動鎖定。');
+        }
+      }, 1000);
+
+    } else {
+      isRecording = false;
+      btn.innerText = '繼續考察';
+      btn.className = 'btn-start';
+      if (timerInterval) clearInterval(timerInterval);
+    }
+  }
+
+  function updateTimerDisplay() {
+    let remaining = totalSeconds > 0 ? (totalSeconds - elapsedSeconds) : elapsedSeconds;
+    let m = Math.floor(remaining / 60).toString().padStart(2, '0');
+    let s = (remaining % 60).toString().padStart(2, '0');
+    document.getElementById('timer-clock').innerText = `${m}:${s}`;
+    updateUI();
+  }
+
+  function updateUI() {
+    document.getElementById('count-target1').innerText = countTarget1;
+    document.getElementById('count-target2').innerText = countTarget2;
+
+    const total = countTarget1 + countTarget2;
+    document.getElementById('count-total').innerText = total;
+
+    const minutes = elapsedSeconds / 60;
+    const ppm = minutes > 0 ? (total / minutes).toFixed(1) : 0.0;
+    document.getElementById('ppm').innerText = ppm;
+  }
+
+  function exportCSV() {
+    const t1Text = document.getElementById('select-target1').options[document.getElementById('select-target1').selectedIndex].text;
+    const t2Text = document.getElementById('select-target2').options[document.getElementById('select-target2').selectedIndex].text;
+    const total = countTarget1 + countTarget2;
+    const minutes = (elapsedSeconds / 60).toFixed(1);
+    const ppm = minutes > 0 ? (total / minutes).toFixed(1) : 0;
+    const now = new Date().toLocaleString('zh-HK');
+
+    let csvContent = "data:text/csv;charset=utf-8,\uFEFF";
+    csvContent += "選址考察項目,數據\n";
+    csvContent += `考察時間,${now}\n`;
+    csvContent += `實測總時長(分鐘),${minutes}\n`;
+    csvContent += `目標 A (${t1Text}),${countTarget1}\n`;
+    csvContent += `目標 B (${t2Text}),${countTarget2}\n`;
+    csvContent += `總計數量,${total}\n`;
+    csvContent += `每分鐘平均流量,${ppm}\n`;
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `選址考察報告_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function toggleCamera() {
+    currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+    startCamera();
+  }
+
+  window.onload = loadModel;
+</script>
+
+</body>
+</html>
